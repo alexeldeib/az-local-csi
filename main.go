@@ -4,14 +4,25 @@ import (
 	// DEBUG/PROFILING ONLY
 	// _ "net/http/pprof"
 
+	"context"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"contrib.go.opencensus.io/exporter/jaeger"
 	"contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
+	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
+	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
+	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/pkg/errors"
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/plugin/ochttp"
@@ -19,21 +30,41 @@ import (
 	"go.opencensus.io/trace"
 	"go.opencensus.io/zpages"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 var (
+	csiSocket            = "/csi/csi.sock"
 	prometheusPort       = ":9090"
+	grpcHealthPort       = ":8082"
 	agentEndpointURI     = "localhost:6831"
 	collectorEndpointURI = "http://localhost:14268/api/traces"
 	zpageAddress         = "127.0.0.1:8081"
 	serverAddress        = "0.0.0.0:8080"
 	sugar                *zap.SugaredLogger
 	logger               *zap.Logger
+	httpServer           *http.Server
+	grpcServer           *grpc.Server
+	// grpcHealthServer     *grpc.Server
+	// healthServer         *health.Server
 )
 
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
+
+	// main context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Signal handler
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(interrupt)
+
+	// errgroup for grpc, http, and health servers
+	g, ctx := errgroup.WithContext(ctx)
 
 	// Setup logger
 	var err error
@@ -47,20 +78,113 @@ func main() {
 	// Enable metrics and traces via prometheus/jaeger
 	enableObservabilityAndExporters(sugar)
 
+	// // Setup gRPC health server
+	// g.Go(func() error {
+	// 	grpcHealthServer = grpc.NewServer()
+	// 	healthServer = health.NewServer()
+	// 	healthpb.RegisterHealthServer(grpcHealthServer, healthServer)
+	// 	healthListener, err := net.Listen("tcp", grpcHealthPort)
+	// 	if err != nil {
+	// 		sugar.Error(err, "gRPC Health server: failed to listen")
+	// 		os.Exit(2)
+	// 	}
+	// 	sugar.Info(fmt.Sprintf("gRPC health server serving at %s", grpcHealthPort))
+	// 	return grpcHealthServer.Serve(healthListener)
+	// })
+
 	router := http.NewServeMux()
 	router.Handle("/healthz", instrument("/healthz", healthz))
 	router.Handle("/livez", instrument("/livez", livez))
 	router.Handle("/readyz", instrument("/readyz", readyz))
 
-	srv := grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{}))
-	csi.RegisterIdentityServer(srv, &identityServer{})
-	csi.RegisterControllerServer(srv, &controllerServer{})
-	csi.RegisterNodeServer(srv, &nodeServer{})
+	httpServer = &http.Server{
+		Addr:         serverAddress,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		Handler: &ochttp.Handler{
+			Handler: router,
+		},
+	}
+
+	// Setup gRPC server
+	grpcServer = grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionAge: 2 * time.Minute}),
+		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			grpc_ctxtags.StreamServerInterceptor(),
+			grpc_opentracing.StreamServerInterceptor(),
+			grpc_prometheus.StreamServerInterceptor,
+			grpc_zap.StreamServerInterceptor(logger),
+			grpc_recovery.StreamServerInterceptor(),
+		)),
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			grpc_ctxtags.UnaryServerInterceptor(),
+			grpc_opentracing.UnaryServerInterceptor(),
+			grpc_prometheus.UnaryServerInterceptor,
+			grpc_zap.UnaryServerInterceptor(logger),
+			grpc_recovery.UnaryServerInterceptor(),
+		)),
+	)
+
+	csi.RegisterIdentityServer(grpcServer, &identityServer{})
+	csi.RegisterControllerServer(grpcServer, &controllerServer{})
+	csi.RegisterNodeServer(grpcServer, &nodeServer{})
+
+	listener, err := net.Listen("unix", csiSocket)
+	if err != nil {
+		sugar.Fatal(err)
+	}
 
 	sugar.Info("starting server")
-	sugar.Fatal(http.ListenAndServe(serverAddress, &ochttp.Handler{
-		Handler: router,
-	}))
+	g.Go(func() error {
+		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		return grpcServer.Serve(listener)
+	})
+
+	select {
+	case <-interrupt:
+		break
+	case <-ctx.Done():
+		break
+	}
+
+	sugar.Info("received shutdown signal")
+
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if httpServer != nil {
+		_ = httpServer.Shutdown(shutdownCtx)
+	}
+
+	if grpcServer != nil {
+		stopped := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(stopped)
+		}()
+
+		t := time.NewTimer(30 * time.Second)
+		select {
+		case <-t.C:
+			grpcServer.Stop()
+		case <-stopped:
+			t.Stop()
+		}
+	}
+
+	err = g.Wait()
+	if err != nil {
+		sugar.Fatal(err)
+	}
 }
 
 func enableObservabilityAndExporters(sugar *zap.SugaredLogger) error {
