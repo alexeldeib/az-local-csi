@@ -39,16 +39,11 @@ func main() {
 	defer logger.Sync()
 	sugar := logger.Sugar()
 
-	// Initialize plugin
-	d := newDriver(sugar)
-
 	// Enable metrics and traces via prometheus/jaeger
 	enableObservabilityAndExporters(sugar)
 
-	sugar.Info(pattern.Match([]byte("/dev/nvme0n2")))
-	sugar.Info(pattern.Match([]byte("/dev/nvme0n112asf")))
-	sugar.Info(pattern.Match([]byte("/dev/nvme0112asf")))
-	sugar.Info(pattern.Match([]byte("/dev/nvme0n")))
+	// Initialize plugin
+	d := newDriver(sugar)
 
 	// start...
 	shutdownCtx := d.start(ctx)
