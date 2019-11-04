@@ -1,8 +1,6 @@
 package main
 
 import (
-	// DEBUG/PROFILING ONLY
-
 	"log"
 	"math/rand"
 	"os"

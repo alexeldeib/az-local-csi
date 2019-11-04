@@ -87,6 +87,7 @@ func newHTTPServer() *HTTPServer {
 	router.Handle("/livez", instrument("/livez", livez))
 	router.Handle("/readyz", instrument("/readyz", readyz))
 
+	// Consider disabling
 	router.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
 	router.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
 	router.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
