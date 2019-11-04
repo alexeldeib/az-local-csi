@@ -12,6 +12,10 @@ var _ csi.NodeServer = &nodeServer{}
 
 type nodeServer struct{}
 
+func newNodeServer() *nodeServer {
+	return &nodeServer{}
+}
+
 func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	// _, span := trace.StartSpan(context.Background(), "xyz.alexeldeib.csi.node.NodePublishVolume")
 	// defer span.End()

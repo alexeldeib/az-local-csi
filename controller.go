@@ -12,6 +12,10 @@ var _ csi.ControllerServer = &controllerServer{}
 
 type controllerServer struct{}
 
+func newControllerServer() *controllerServer {
+	return &controllerServer{}
+}
+
 func (s *controllerServer) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	// _, span := trace.StartSpan(context.Background(), "xyz.alexeldeib.csi.controller.ControllerGetCapabilities")
 	// defer span.End()

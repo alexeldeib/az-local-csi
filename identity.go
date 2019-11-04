@@ -12,6 +12,10 @@ var _ csi.IdentityServer = &identityServer{}
 
 type identityServer struct{}
 
+func newIdentityServer() *identityServer {
+	return &identityServer{}
+}
+
 func (s *identityServer) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
 	// _, span := trace.StartSpan(context.Background(), "xyz.alexeldeib.csi.identity.GetPluginInfo")
 	// defer span.End()
