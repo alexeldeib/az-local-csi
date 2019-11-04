@@ -2,12 +2,13 @@ package main
 
 import (
 	// DEBUG/PROFILING ONLY
-	// _ "net/http/pprof"
 
-	"context"
 	"log"
 	"math/rand"
+	"os"
+	"os/signal"
 	"regexp"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,10 +28,6 @@ func main() {
 	// Seed prng
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	// main context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Setup logger
 	logger, err := zap.NewDevelopment() // or NewProduction
 	if err != nil {
@@ -42,17 +39,18 @@ func main() {
 	// Enable metrics and traces via prometheus/jaeger
 	enableObservabilityAndExporters(sugar)
 
-	// Initialize plugin
-	d := newDriver(sugar)
+	// Signal handler
+	var interrupt = make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(interrupt)
 
-	// start...
-	shutdownCtx := d.start(ctx)
+	httpServer := newHTTPServer()
+	grpcServer := newGRPCServer(logger)
+	server := newServer(httpServer, grpcServer)
 
 	// block until SIGINT/SIGTERM or an error...
-	d.block(shutdownCtx, cancel)
-
-	// ...and terminate
-	if err := d.stop(); err != nil {
+	sugar.Info("starting server")
+	if err := server.Start(interrupt); err != nil {
 		sugar.Fatal(err)
 	}
 }

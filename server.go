@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"net"
 	"net/http"
+	"net/http/pprof"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -18,23 +23,122 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-func newHTTPServer() *http.Server {
+type Server struct {
+	http *HTTPServer
+	grpc *GRPCServer
+	errs chan error
+}
+
+func newServer(http *HTTPServer, grpc *GRPCServer) *Server {
+	return &Server{
+		http: http,
+		grpc: grpc,
+		errs: make(chan error),
+	}
+}
+
+func (s *Server) Start(stop chan os.Signal) error {
+	go s.http.Start(s.errs)
+	go s.grpc.Start(s.errs)
+
+	select {
+	case <-stop:
+		return nil
+	case err := <-s.errs:
+		return err
+	}
+}
+
+func (s *Server) Shutdown() {
+	var wg = &sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		s.http.Shutdown()
+		wg.Done()
+	}()
+	go func() {
+		s.grpc.Shutdown()
+		wg.Done()
+	}()
+	wg.Wait()
+}
+
+type HTTPServer struct {
+	srv *http.Server
+}
+
+func (h *HTTPServer) Start(errs chan<- error) {
+	if err := h.srv.ListenAndServe(); err != http.ErrServerClosed {
+		errs <- err
+	}
+}
+
+func (h *HTTPServer) Shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if h.srv != nil {
+		_ = h.srv.Shutdown(ctx)
+	}
+}
+
+func newHTTPServer() *HTTPServer {
 	router := http.NewServeMux()
 	router.Handle("/healthz", instrument("/healthz", healthz))
 	router.Handle("/livez", instrument("/livez", livez))
 	router.Handle("/readyz", instrument("/readyz", readyz))
 
-	return &http.Server{
-		Addr:         serverAddress,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		Handler: &ochttp.Handler{
-			Handler: router,
+	router.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	router.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	router.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	router.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	router.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+
+	return &HTTPServer{
+		srv: &http.Server{
+			Addr:         serverAddress,
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+			Handler: &ochttp.Handler{
+				Handler: router,
+			},
 		},
 	}
 }
 
-func newGRPCServer(logger *zap.Logger) *grpc.Server {
+type GRPCServer struct {
+	srv *grpc.Server
+}
+
+func (g *GRPCServer) Start(errs chan<- error) {
+	listener, err := net.Listen("unix", csiSocket)
+	if err != nil {
+		errs <- err
+		return
+	}
+	if err := g.srv.Serve(listener); err != nil {
+		errs <- err
+	}
+}
+
+func (g *GRPCServer) Shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if g.srv != nil {
+		stopped := make(chan struct{})
+		go func() {
+			g.srv.GracefulStop()
+			close(stopped)
+		}()
+
+		select {
+		case <-ctx.Done():
+			g.srv.Stop()
+		case <-stopped:
+		}
+	}
+}
+
+func newGRPCServer(logger *zap.Logger) *GRPCServer {
 	grpcServer := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionAge: 2 * time.Minute}),
 		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
@@ -56,7 +160,9 @@ func newGRPCServer(logger *zap.Logger) *grpc.Server {
 	csi.RegisterIdentityServer(grpcServer, newIdentityServer())
 	csi.RegisterControllerServer(grpcServer, newControllerServer())
 	csi.RegisterNodeServer(grpcServer, newNodeServer())
-	return grpcServer
+	return &GRPCServer{
+		srv: grpcServer,
+	}
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
