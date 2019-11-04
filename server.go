@@ -13,6 +13,7 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/plugin/ochttp"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )
@@ -33,7 +34,7 @@ func newHTTPServer() *http.Server {
 	}
 }
 
-func newGRPCServer() *grpc.Server {
+func newGRPCServer(logger *zap.Logger) *grpc.Server {
 	grpcServer := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionAge: 2 * time.Minute}),
 		grpc.StatsHandler(&ocgrpc.ServerHandler{}),

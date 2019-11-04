@@ -7,10 +7,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
-	"os"
-	"os/signal"
 	"regexp"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -44,10 +41,6 @@ func main() {
 
 	// Initialize plugin
 	d := newDriver(sugar)
-
-	// Signal handler
-	signal.Notify(d.interrupt, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(d.interrupt)
 
 	// Enable metrics and traces via prometheus/jaeger
 	enableObservabilityAndExporters(sugar)

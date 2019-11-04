@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,13 +25,16 @@ type driver struct {
 func newDriver(log *zap.SugaredLogger) *driver {
 	return &driver{
 		httpServer: newHTTPServer(),
-		grpcServer: newGRPCServer(),
+		grpcServer: newGRPCServer(log.Desugar()),
 		log:        log,
 		interrupt:  make(chan os.Signal, 1),
 	}
 }
 
 func (d *driver) start(ctx context.Context) context.Context {
+	// Signal handler
+	signal.Notify(d.interrupt, os.Interrupt, syscall.SIGTERM)
+
 	// errgroup for grpc, http, and health servers
 	g, ctx := errgroup.WithContext(ctx)
 	d.errgroup = g
@@ -69,6 +74,8 @@ func (d *driver) stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	defer signal.Stop(d.interrupt)
+
 	if d.httpServer != nil {
 		_ = d.httpServer.Shutdown(ctx)
 	}
@@ -86,6 +93,5 @@ func (d *driver) stop() error {
 		case <-stopped:
 		}
 	}
-
 	return d.errgroup.Wait()
 }
